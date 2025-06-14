@@ -238,7 +238,7 @@ function run_server_threaded(port::Int, handler::Function;
     @info "Server started" message = start_message threads = actual_threads
 
     # Main event loop
-    try
+    main_thread = Threads.@spawn :interactive try
         while true
             # Get events from the Go server
             events = get_events()
@@ -278,6 +278,7 @@ function run_server_threaded(port::Int, handler::Function;
         # Stop the server
         stop_server()
     end
+    wait(main_thread)
 end
 
 end # module
