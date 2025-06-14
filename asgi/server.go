@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+// Configuration constants
+const (
+	// Maximum number of concurrent requests to process
+	maxConcurrentRequests = 1000
+	// Request timeout in seconds
+	requestTimeout = 30
+)
+
 // Global variables to manage the server state
 var (
 	server   *http.Server
@@ -21,6 +29,10 @@ var (
 	pendingMu    sync.Mutex
 	pendingReqs        = make(map[string]chan ASGIResponse)
 	requestIdSeq int64 = 0
+
+	// Semaphore to limit concurrent requests
+	// Using a buffered channel as a counting semaphore
+	requestSemaphore = make(chan struct{}, maxConcurrentRequests)
 )
 
 // ASGIEvent represents a standard ASGI event
@@ -59,6 +71,9 @@ func StartServer(port int) *C.char {
 	pendingReqs = make(map[string]chan ASGIResponse)
 	pendingMu.Unlock()
 
+	// Reset the semaphore
+	requestSemaphore = make(chan struct{}, maxConcurrentRequests)
+
 	// Create a new server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleRequest)
@@ -75,7 +90,7 @@ func StartServer(port int) *C.char {
 		}
 	}()
 
-	return C.CString(fmt.Sprintf("Server started on port %d", port))
+	return C.CString(fmt.Sprintf("Server started on port %d with max %d concurrent requests", port, maxConcurrentRequests))
 }
 
 //export StopServer
@@ -102,6 +117,17 @@ func StopServer() *C.char {
 		delete(pendingReqs, id)
 	}
 	pendingMu.Unlock()
+
+	// Drain the semaphore to unblock any waiting goroutines
+	for i := 0; i < maxConcurrentRequests; i++ {
+		select {
+		case requestSemaphore <- struct{}{}:
+			// Added a token
+		default:
+			// Semaphore is full
+			break
+		}
+	}
 
 	server = nil
 	return C.CString("Server stopped")
@@ -153,6 +179,22 @@ func SubmitResponse(responseJson *C.char) *C.char {
 
 // handleRequest processes incoming HTTP requests and creates ASGI events
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	// Try to acquire a semaphore token with a short timeout
+	// This prevents the server from accepting more requests than it can handle
+	select {
+	case requestSemaphore <- struct{}{}:
+		// Got a token, proceed with the request
+		defer func() {
+			// Always release the token when done
+			<-requestSemaphore
+		}()
+	case <-time.After(30 * time.Second):
+		// Could not get a token within timeout, server is overloaded
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Server is at capacity, please try again later"))
+		return
+	}
+
 	// Generate a unique request ID
 	requestId := generateRequestId()
 
@@ -192,8 +234,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(response.Status)
 		w.Write(response.Body)
 
-	// TODO: Customize timeout
-	case <-time.After(30 * time.Second):
+	case <-time.After(time.Duration(requestTimeout) * time.Second):
 		// Timeout after waiting too long
 		pendingMu.Lock()
 		delete(pendingReqs, requestId)
