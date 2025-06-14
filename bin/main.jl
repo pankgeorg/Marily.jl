@@ -5,8 +5,8 @@ function my_handler(event)
     # Create a response
     status = 200
     headers = Dict("Content-Type" => ["text/plain"])
-    body = "Hello from Julia! You requested: $(event.scope.path)"
-
+    y = sum(rand(1000, 40) * rand(40, 1000))
+    body = "Hello from Julia! You requested: $(event.scope.path) $(y) \n"
     return (status, headers, body)
 end
 
