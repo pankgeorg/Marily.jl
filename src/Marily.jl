@@ -2,7 +2,8 @@ module Marily
 
 using JSON3
 
-export start_server, stop_server, get_events, process_events, submit_response
+
+export start_server, stop_server, get_events, process_events, submit_response, run_server, run_server_threaded
 
 # Load the shared object file
 const libpath = joinpath(@__DIR__, "../asgi/libasgi.so")
@@ -99,7 +100,7 @@ The handler should accept an event and return a tuple of (status, headers, body)
 or nothing if no response is needed.
 """
 function process_events(handler::Function)
-    @time "Processing" events = get_events()
+    events = get_events()
     if isempty(events)
         return 0
     end
@@ -132,9 +133,26 @@ function process_events_async(handler::Function)
 end
 
 """
+    process_event(event, handler::Function)
+
+Process a single event with the provided handler function.
+"""
+function process_event(event, handler::Function)
+    response = handler(event)
+    if response !== nothing
+        request_id = event.request_id
+        status, headers, body = response
+        submit_response(request_id, status, headers, body)
+        return 1
+    end
+    return 0
+end
+
+"""
     run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
 
 Run the server and process events in a loop until interrupted.
+Single-threaded version.
 """
 function run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
     start_server(port)
@@ -150,6 +168,87 @@ function run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
             @error "Error in server loop" exception = (e, catch_backtrace())
         end
     finally
+        stop_server()
+    end
+end
+
+"""
+    run_server_threaded(port::Int, handler::Function;
+                      polling_interval::Float64=0.0,
+                      num_threads::Int=Threads.nthreads())
+
+Run the server and distribute event processing across all available Julia threads.
+Efficiently handles high request volumes by parallelizing event processing.
+"""
+function run_server_threaded(port::Int, handler::Function;
+    polling_interval::Float64=0.0,
+    num_threads::Int=Threads.nthreads())
+    # Check if Julia was started with multiple threads
+    if Threads.nthreads() <= 1
+        @warn "Julia is running with only one thread. For better performance, start Julia with multiple threads using: julia --threads=auto"
+        return run_server(port, handler; polling_interval=polling_interval)
+    end
+
+    # Limit number of worker threads to available threads (minus one for the main thread)
+    actual_threads = min(num_threads, Threads.nthreads() - 1)
+    actual_threads = max(1, actual_threads)  # Ensure at least one worker thread
+
+    # Create a channel for tracking active workers
+    active_workers = Threads.Atomic{Int}(0)
+
+    # Start worker threads
+    worker_tasks = Task[]
+    for i in 1:actual_threads
+        task = Threads.@spawn begin
+            # Mark this worker as active
+            Threads.atomic_add!(active_workers, 1)
+            try
+                while true
+                    events = get_events()
+                    # Get an event from the channel or wait
+                    for event in events
+                        # Process the event
+                        try
+                            process_event(event, handler)
+                        catch e
+                            @error "Error processing event" exception = (e, catch_backtrace()) event = event
+                        end
+                    end
+                end
+            finally
+                # Mark this worker as inactive
+                Threads.atomic_sub!(active_workers, 1)
+            end
+        end
+        push!(worker_tasks, task)
+    end
+
+    # Start the server
+    start_message = start_server(port)
+    @info "Server started" message = start_message threads = actual_threads
+    try
+        wait()
+    catch e
+        if isa(e, InterruptException)
+            @info "Server interrupted, shutting down..."
+        else
+            @error "Error in server loop" exception = (e, catch_backtrace())
+        end
+    finally
+
+        # Wait for all workers to finish processing their current events
+        @info "Waiting for worker threads to finish..."
+        timeout = 10.0  # seconds
+        start_time = time()
+        while Threads.atomic_get(active_workers) > 0
+            if time() - start_time > timeout
+                @warn "Timeout waiting for worker threads to finish"
+                break
+            end
+            sleep(0.1)
+        end
+
+        # Stop the server
         stop_server()
     end
 end
