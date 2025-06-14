@@ -1,0 +1,6 @@
+name = "JASGI"
+uuid = "b26183ae-495b-11f0-a7b5-00155dec066a"
+authors = "Panagiotis Georgakopoulos <pankgeorg@gmail.com>"
+
+[deps]
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
