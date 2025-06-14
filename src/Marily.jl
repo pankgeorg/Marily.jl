@@ -99,7 +99,7 @@ The handler should accept an event and return a tuple of (status, headers, body)
 or nothing if no response is needed.
 """
 function process_events(handler::Function)
-    events = get_events()
+    @time "Processing" events = get_events()
     if isempty(events)
         return 0
     end

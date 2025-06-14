@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -16,9 +15,23 @@ func generateRequestId() string {
 
 // createASGIEvent converts an HTTP request to an ASGI event with a request ID
 func createASGIEvent(r *http.Request, requestId string) ASGIEvent {
-	// Read the body content
-	bodyBytes, _ := ioutil.ReadAll(r.Body)
-	defer r.Body.Close()
+	// Read the body content (simplified for example)
+	// TODO:  In a real implementation, you'd want to handle larger bodies appropriately
+
+	// Alternative (TODO)
+	// bodyBytes, _ := ioutil.ReadAll(r.Body)
+	// defer r.Body.Close()
+
+	body := []byte{}
+	if r.Body != nil {
+		// Read up to 1MB of request body
+		body = make([]byte, 1<<20)
+		n, _ := r.Body.Read(body)
+		if n > 0 {
+			body = body[:n]
+		}
+		r.Body.Close()
+	}
 
 	// Create the ASGI scope
 	scope := map[string]interface{}{
@@ -37,7 +50,7 @@ func createASGIEvent(r *http.Request, requestId string) ASGIEvent {
 
 	// Create the ASGI message
 	message := map[string]interface{}{
-		"body":      bodyBytes,
+		"body":      body,
 		"more_body": false,
 	}
 
@@ -87,4 +100,17 @@ func splitHostPort(hostport string) (string, string) {
 	host, port := "localhost", "80"
 	// Implementation omitted for brevity
 	return host, port
+}
+
+// getHeadersList converts HTTP headers to ASGI format (list of [key, value] pairs)
+func getHeadersList(r *http.Request) [][]string {
+	headers := make([][]string, 0)
+	for name, values := range r.Header {
+		for _, value := range values {
+			headers = append(headers, []string{name, value})
+		}
+	}
+	// Add host header
+	headers = append(headers, []string{"host", r.Host})
+	return headers
 }
