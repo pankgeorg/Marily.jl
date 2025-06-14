@@ -1,4 +1,4 @@
-module JASGI
+module Marily
 
 using JSON3
 

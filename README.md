@@ -34,24 +34,10 @@ go build -buildmode=c-shared -o libasgi.so .
 
 ## Using the Julia Wrapper
 
-```julia
-using JASGI
+See `main/bin.jl`.
 
-# Define a handler function
-function my_handler(event)
-    # Log the event
-    println("Received request: ", event.scope.path)
-    
-    # Create a response
-    status = 200
-    headers = Dict("Content-Type" => ["text/plain"])
-    body = "Hello from Julia! You requested: $(event.scope.path)"
-    
-    return (status, headers, body)
-end
-
-# Start the server and process events
-JASGI.run_server(8000, my_handler)
+```bash
+julia --project=. bin/main.jl
 ```
 
 ## Requirements

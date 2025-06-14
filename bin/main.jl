@@ -1,4 +1,4 @@
-using JASGI
+using Marily
 
 # Define a handler function
 function my_handler(event)
@@ -11,4 +11,4 @@ function my_handler(event)
 end
 
 # Start the server and process events
-JASGI.run_server(8000, my_handler)
+Marily.run_server(8000, my_handler)
