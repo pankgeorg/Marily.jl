@@ -1,18 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"io/ioutil"
 	"net/http"
-	"sync/atomic"
+	"strings"
 	"time"
 )
-
-// generateRequestId creates a unique ID for each request
-func generateRequestId() string {
-	id := atomic.AddInt64(&requestIdSeq, 1)
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), id)
-}
 
 // createASGIEvent converts an HTTP request to an ASGI event with a request ID
 func createASGIEvent(r *http.Request, requestId string) ASGIEvent {
@@ -58,33 +51,30 @@ func getScheme(r *http.Request) string {
 	return "http"
 }
 
-// Helper function to access request headers that was referenced in the original code
-func getHeaders(r *http.Request) map[string][]string {
-	headers := make(map[string][]string)
-	for name, values := range r.Header {
-		headers[name] = values
-	}
-	return headers
-}
-
 // getClientInfo extracts client information
 func getClientInfo(r *http.Request) []string {
-	host, port := splitHostPort(r.RemoteAddr)
+	hostport := r.RemoteAddr
+	host, port := "127.0.0.1", "0"
+
+	// Basic parsing of host:port format
+	if idx := strings.LastIndex(hostport, ":"); idx > 0 {
+		host = hostport[:idx]
+		port = hostport[idx+1:]
+	}
+
 	return []string{host, port}
 }
 
 // getServerInfo extracts server information
 func getServerInfo(r *http.Request) []string {
-	// A simplified version - in production, you'd parse this properly
+	hostport := r.Host
 	host, port := "localhost", "80"
-	return []string{host, port}
-}
 
-// splitHostPort is a helper to split host:port strings
-func splitHostPort(hostport string) (string, string) {
-	// Simple implementation - in a real app, you'd use net.SplitHostPort
-	// and handle edge cases more robustly
-	host, port := "localhost", "80"
-	// Implementation omitted for brevity
-	return host, port
+	// Basic parsing of host:port format
+	if idx := strings.LastIndex(hostport, ":"); idx > 0 {
+		host = hostport[:idx]
+		port = hostport[idx+1:]
+	}
+
+	return []string{host, port}
 }

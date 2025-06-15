@@ -2,10 +2,17 @@ module Marily
 
 using JSON3
 
-export start_server, stop_server, get_events, process_events, submit_response
+export start_server, stop_server, register_event_handler, run_server
 
 # Load the shared object file
 const libpath = joinpath(@__DIR__, "../asgi/libasgi.so")
+
+# Global storage for the event handler callback
+global event_handler_func = nothing
+global event_callback_ptr = C_NULL
+
+# Thread safety for callback registration
+const callback_lock = ReentrantLock()
 
 function __init__()
     # Ensure the library exists
@@ -13,6 +20,89 @@ function __init__()
         error("Cannot find ASGI Go library at $libpath")
     end
 end
+
+"""
+    process_event_callback(event_json::Cstring)::Cstring
+
+C-callable function that processes an ASGI event received from Go.
+This is the function that Go will call directly when an event occurs.
+"""
+function process_event_callback(event_json::Cstring)::Cstring
+    try
+        # Parse the event JSON
+        json_str = unsafe_string(event_json)
+        event = JSON3.read(json_str)
+
+        # Check if we have a handler registered
+        if event_handler_func === nothing
+            return C_NULL
+        end
+
+        # Call the handler
+        response = event_handler_func(event)
+
+        # If no response is needed or handler returned nothing
+        if response === nothing
+            return C_NULL
+        end
+
+        # Extract response components
+        request_id = event.request_id
+        status, headers, body = response
+
+        # Create response object
+        resp_obj = Dict(
+            "request_id" => request_id,
+            "status" => status,
+            "headers" => headers,
+            "body" => body isa String ? Vector{UInt8}(body) : body
+        )
+
+        # Convert to JSON
+        json_response = JSON3.write(resp_obj)
+
+        # Return a C string with the response
+        # IMPORTANT: We must allocate memory that Go can free
+        c_response = Base.Libc.malloc(length(json_response) + 1)
+        unsafe_copyto!(Ptr{UInt8}(c_response), pointer(json_response), length(json_response))
+        unsafe_store!(Ptr{UInt8}(c_response) + length(json_response), 0) # Null terminator
+
+        return Cstring(c_response)
+
+    catch e
+        # Handle any errors in the callback
+        error_msg = "Error in Julia callback: $(sprint(showerror, e, catch_backtrace()))"
+        @error error_msg
+
+        # Return C_NULL to indicate an error
+        return C_NULL
+    end
+end
+
+"""
+    register_event_handler(handler::Function)
+
+Register a callback function that will be directly called by Go when an ASGI event is received.
+The handler should accept an event and return a tuple of (status, headers, body) or nothing.
+"""
+function register_event_handler(handler::Function)
+    lock(callback_lock) do
+        global event_handler_func = handler
+
+        # Create a C-callable function that will invoke our handler
+        # The type signatures must match exactly
+        c_handler = @cfunction(process_event_callback, Cstring, (Cstring,))
+        global event_callback_ptr = c_handler
+
+        # Register the callback with Go
+        result = ccall((:RegisterEventCallback, libpath), Cstring, (Ptr{Cvoid},), c_handler)
+        message = unsafe_string(result)
+        Libc.free(result)
+
+        return message
+    end
+end
+
 
 """
     start_server(port::Int)
@@ -39,109 +129,24 @@ function stop_server()
 end
 
 """
-    get_events()
+    run_server(port::Int, handler::Function)
 
-Retrieve all ASGI events from the server and clear the event queue.
-Returns a Vector of event dictionaries.
+Run the server with the provided event handler.
+This is a simplified interface that registers the handler and starts the server.
 """
-function get_events()
-    result = ccall((:GetEvents, libpath), Cstring, ())
-    json_str = unsafe_string(result)
-    Libc.free(result)
+function run_server(port::Int, handler::Function)
+    # Register the handler
+    register_message = register_event_handler(handler)
+    @info "Registered event handler: $register_message"
 
-    if json_str == "[]"
-        return []
-    end
+    # Start the server
+    start_message = start_server(port)
+    @info "Started server: $start_message"
 
-    # Parse JSON string into Julia objects
-    return JSON3.read(json_str)
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-
-Submit a response for a specific request back to the Go server.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-    # Create the response object
-    response = Dict(
-        "request_id" => request_id,
-        "status" => status,
-        "headers" => headers,
-        "body" => body
-    )
-
-    # Convert to JSON
-    json_response = JSON3.write(response)
-
-    # Call the Go function
-    result = ccall((:SubmitResponse, libpath), Cstring, (Cstring,), json_response)
-    message = unsafe_string(result)
-    Libc.free(result)
-
-    return message
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::String)
-
-Convenience method that takes a string body instead of raw bytes.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::String)
-    submit_response(request_id, status, headers, Vector{UInt8}(body))
-end
-
-"""
-    process_events(handler::Function)
-
-Process all pending ASGI events with the provided handler function.
-The handler should accept an event and return a tuple of (status, headers, body)
-or nothing if no response is needed.
-"""
-function process_events(handler::Function)
-    events = get_events()
-    if isempty(events)
-        return 0
-    end
-
-    processed = 0
-    for event in events
-        # Handle each event
-        response = handler(event)
-
-        # If the handler returned a response, submit it
-        if response !== nothing
-            request_id = event.request_id
-            status, headers, body = response
-            submit_response(request_id, status, headers, body)
-            processed += 1
-        end
-    end
-
-    return processed
-end
-
-"""
-    process_events_async(handler::Function)
-
-Process events asynchronously in a separate task.
-Returns a task handle that can be waited on if needed.
-"""
-function process_events_async(handler::Function)
-    return @async process_events(handler)
-end
-
-"""
-    run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
-
-Run the server and process events in a loop until interrupted.
-"""
-function run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
-    start_server(port)
     try
+        # Keep the Julia process running
         while true
-            process_events(handler)
-            polling_interval > 0 && sleep(polling_interval)
+            sleep(1)
         end
     catch e
         if isa(e, InterruptException)

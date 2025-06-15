@@ -1,32 +1,56 @@
 package main
 
+// #include <stdlib.h>
+// typedef char* (*EventCallbackFn)(const char*);
+//
+// // C helper function that does the casting for us
+// static inline char* callEventCallback(void* fn_ptr, char* input) {
+//   if (fn_ptr == NULL) return NULL;
+//   EventCallbackFn fn = (EventCallbackFn)fn_ptr;
+//   return fn(input);
+// }
+import "C"
+
 import (
-	"C"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
+)
+
+// Configuration constants
+const (
+	// Maximum number of concurrent requests to process
+	maxConcurrentRequests = 1000
+	// Request timeout for callback in seconds
+	callbackTimeout = 30
 )
 
 // Global variables to manage the server state
 var (
 	server   *http.Server
-	eventsMu sync.Mutex
-	events   []ASGIEvent
 	serverMu sync.Mutex
 
-	// Pending responses mechanism
-	pendingMu    sync.Mutex
-	pendingReqs        = make(map[string]chan ASGIResponse)
+	// Event callback mechanism
+	eventCallbackMu sync.Mutex
+	eventCallback   unsafe.Pointer // Stores the Julia callback function
+
+	// Request ID generation
 	requestIdSeq int64 = 0
+
+	// Semaphore to limit concurrent requests
+	// Using a buffered channel as a counting semaphore
+	requestSemaphore = make(chan struct{}, maxConcurrentRequests)
 )
 
 // ASGIEvent represents a standard ASGI event
 type ASGIEvent struct {
 	Type      string                 `json:"type"`
-	RequestId string                 `json:"request_id"` // Added request ID for tracking
+	RequestId string                 `json:"request_id"`
 	Scope     map[string]interface{} `json:"scope"`
 	Message   map[string]interface{} `json:"message"`
 	Time      time.Time              `json:"time"`
@@ -40,6 +64,15 @@ type ASGIResponse struct {
 	Body      []byte              `json:"body"`
 }
 
+//export RegisterEventCallback
+func RegisterEventCallback(callback unsafe.Pointer) *C.char {
+	eventCallbackMu.Lock()
+	defer eventCallbackMu.Unlock()
+
+	eventCallback = callback
+	return C.CString("Event callback registered successfully")
+}
+
 //export StartServer
 func StartServer(port int) *C.char {
 	serverMu.Lock()
@@ -49,15 +82,8 @@ func StartServer(port int) *C.char {
 		return C.CString("Server is already running")
 	}
 
-	// Initialize the event queue
-	eventsMu.Lock()
-	events = make([]ASGIEvent, 0)
-	eventsMu.Unlock()
-
-	// Reset pending requests
-	pendingMu.Lock()
-	pendingReqs = make(map[string]chan ASGIResponse)
-	pendingMu.Unlock()
+	// Reset the semaphore
+	requestSemaphore = make(chan struct{}, maxConcurrentRequests)
 
 	// Create a new server
 	mux := http.NewServeMux()
@@ -75,7 +101,7 @@ func StartServer(port int) *C.char {
 		}
 	}()
 
-	return C.CString(fmt.Sprintf("Server started on port %d", port))
+	return C.CString(fmt.Sprintf("Server started on port %d with max %d concurrent requests", port, maxConcurrentRequests))
 }
 
 //export StopServer
@@ -95,114 +121,161 @@ func StopServer() *C.char {
 		return C.CString(fmt.Sprintf("Error shutting down server: %v", err))
 	}
 
-	// Clean up pending requests
-	pendingMu.Lock()
-	for id, ch := range pendingReqs {
-		close(ch)
-		delete(pendingReqs, id)
+	// Drain the semaphore to unblock any waiting goroutines
+	for i := 0; i < maxConcurrentRequests; i++ {
+		select {
+		case requestSemaphore <- struct{}{}:
+			// Added a token
+		default:
+			// Semaphore is full
+			break
+		}
 	}
-	pendingMu.Unlock()
 
 	server = nil
 	return C.CString("Server stopped")
 }
 
-//export GetEvents
-func GetEvents() *C.char {
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-
-	if len(events) == 0 {
-		return C.CString("[]")
+//export GetConcurrentRequests
+func GetConcurrentRequests() *C.char {
+	// Count how many slots are available in the semaphore
+	available := 0
+	for i := 0; i < maxConcurrentRequests; i++ {
+		select {
+		case requestSemaphore <- struct{}{}:
+			available++
+		default:
+			break
+		}
 	}
 
-	jsonData, err := json.Marshal(events)
-	if err != nil {
-		return C.CString(fmt.Sprintf("Error marshaling events: %v", err))
+	// Return the tokens we just took
+	for i := 0; i < available; i++ {
+		<-requestSemaphore
 	}
 
-	// Clear the events after fetching
-	events = make([]ASGIEvent, 0)
-
-	return C.CString(string(jsonData))
-}
-
-//export SubmitResponse
-func SubmitResponse(responseJson *C.char) *C.char {
-	respStr := C.GoString(responseJson)
-
-	var response ASGIResponse
-	if err := json.Unmarshal([]byte(respStr), &response); err != nil {
-		return C.CString(fmt.Sprintf("Error unmarshaling response: %v", err))
-	}
-
-	// Find the corresponding request channel
-	pendingMu.Lock()
-	respChan, exists := pendingReqs[response.RequestId]
-	pendingMu.Unlock()
-
-	if !exists {
-		return C.CString(fmt.Sprintf("No pending request with ID: %s", response.RequestId))
-	}
-
-	// Send the response to the waiting goroutine
-	respChan <- response
-
-	return C.CString("Response submitted successfully")
+	inUse := maxConcurrentRequests - available
+	return C.CString(fmt.Sprintf("%d/%d concurrent requests active", inUse, maxConcurrentRequests))
 }
 
 // handleRequest processes incoming HTTP requests and creates ASGI events
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	// Try to acquire a semaphore token with a short timeout
+	// This prevents the server from accepting more requests than it can handle
+	select {
+	case requestSemaphore <- struct{}{}:
+		// Got a token, proceed with the request
+		defer func() {
+			// Always release the token when done
+			<-requestSemaphore
+		}()
+	case <-time.After(5 * time.Second):
+		// Could not get a token within timeout, server is overloaded
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Server is at capacity, please try again later"))
+		return
+	}
+
+	// Get the callback
+	callback := eventCallback
+	// Check if we have a callback registered
+	if callback == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("No event handler registered"))
+		return
+	}
+
 	// Generate a unique request ID
 	requestId := generateRequestId()
-
-	// Create a channel for this request's response
-	respChan := make(chan ASGIResponse, 1)
-
-	// Register this channel in our pending requests map
-	pendingMu.Lock()
-	pendingReqs[requestId] = respChan
-	pendingMu.Unlock()
 
 	// Create an ASGI event from the HTTP request with the request ID
 	event := createASGIEvent(r, requestId)
 
-	// Store the event for Julia to process
-	eventsMu.Lock()
-	events = append(events, event)
-	eventsMu.Unlock()
-
-	// Wait for Julia to process the event and provide a response
-	// Include a timeout to prevent hanging forever
-	select {
-	case response := <-respChan:
-		// Clean up the pending request
-		pendingMu.Lock()
-		delete(pendingReqs, requestId)
-		pendingMu.Unlock()
-
-		// Write the response headers
-		for key, values := range response.Headers {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-
-		// Write the status code and body
-		w.WriteHeader(response.Status)
-		w.Write(response.Body)
-
-	// TODO: Customize timeout
-	case <-time.After(30 * time.Second):
-		// Timeout after waiting too long
-		pendingMu.Lock()
-		delete(pendingReqs, requestId)
-		close(respChan)
-		pendingMu.Unlock()
-
-		w.WriteHeader(http.StatusGatewayTimeout)
-		w.Write([]byte("Request timed out waiting for processing"))
+	// Convert event to JSON
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		fmt.Printf("Error marshaling event: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Error preparing request"))
+		return
 	}
+
+	// Call the Julia callback directly with the event
+	cEventJSON := C.CString(string(eventJSON))
+	defer C.free(unsafe.Pointer(cEventJSON))
+
+	// Set up a timeout for the callback
+	var cResponseJSON *C.char
+	responseChan := make(chan *C.char, 1)
+	timeoutChan := time.After(time.Duration(callbackTimeout) * time.Second)
+
+	// Call the callback in a goroutine to allow timeout
+	go func() {
+		result := C.callEventCallback(callback, cEventJSON)
+		responseChan <- result
+	}()
+
+	// Wait for the callback to complete or timeout
+	select {
+	case cResponseJSON = <-responseChan:
+		// Callback completed
+	case <-timeoutChan:
+		// Callback timed out
+		close(responseChan)
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte("Request processing timed out"))
+		return
+	}
+
+	// Check if we got a valid response
+	if cResponseJSON == nil {
+		close(responseChan)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("No response from event handler"))
+		return
+	}
+
+	// Convert to Go string and free the memory
+	responseJSON := C.GoString(cResponseJSON)
+	C.free(unsafe.Pointer(cResponseJSON)) // Free the memory allocated by Julia
+
+	// Check if the response is empty
+	if responseJSON == "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Empty response from event handler"))
+		return
+	}
+
+	// Parse the response
+	var response ASGIResponse
+	if err := json.Unmarshal([]byte(responseJSON), &response); err != nil {
+		fmt.Printf("Error unmarshaling callback response: %v\nResponse content: %q\n", err, responseJSON)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Error processing response"))
+		return
+	}
+	// Write the response to the client
+	writeResponse(w, response)
+}
+
+// Helper function to write the response to the HTTP writer
+func writeResponse(w http.ResponseWriter, response ASGIResponse) {
+	// Write the response headers
+	for key, values := range response.Headers {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Write the status code and body
+	w.WriteHeader(response.Status)
+	w.Write(response.Body)
+}
+
+// generateRequestId creates a unique ID for each request
+func generateRequestId() string {
+	id := atomic.AddInt64(&requestIdSeq, 1)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), id)
 }
 
 // getHeadersList converts HTTP headers to ASGI format (list of [key, value] pairs)
