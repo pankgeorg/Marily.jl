@@ -62,16 +62,20 @@ function process_event_callback(event_json::Cstring)::Cstring
         json_response = JSON3.write(resp_obj)
 
         # Return a C string with the response
-        # Note: This memory will be freed by Go
-        return Base.unsafe_convert(Cstring, Base.cconvert(Cstring, json_response))
+        # IMPORTANT: We must allocate memory that Go can free
+        c_response = Base.Libc.malloc(length(json_response) + 1)
+        unsafe_copyto!(Ptr{UInt8}(c_response), pointer(json_response), length(json_response))
+        unsafe_store!(Ptr{UInt8}(c_response) + length(json_response), 0) # Null terminator
+
+        return Cstring(c_response)
+
     catch e
         # Handle any errors in the callback
         error_msg = "Error in Julia callback: $(sprint(showerror, e, catch_backtrace()))"
         @error error_msg
 
-        # Return an error response
-        # The memory will be freed by Go
-        return Base.unsafe_convert(Cstring, Base.cconvert(Cstring, error_msg))
+        # Return C_NULL to indicate an error
+        return C_NULL
     end
 end
 
@@ -86,6 +90,7 @@ function register_event_handler(handler::Function)
         global event_handler_func = handler
 
         # Create a C-callable function that will invoke our handler
+        # The type signatures must match exactly
         c_handler = @cfunction(process_event_callback, Cstring, (Cstring,))
         global event_callback_ptr = c_handler
 

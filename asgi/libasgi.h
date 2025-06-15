@@ -21,8 +21,8 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 
 #line 3 "server.go"
  #include <stdlib.h>
- typedef char* (*EventCallbackFn)(char*);
- 
+ typedef char* (*EventCallbackFn)(const char*);
+
  // C helper function that does the casting for us
  static inline char* callEventCallback(void* fn_ptr, char* input) {
    if (fn_ptr == NULL) return NULL;

@@ -1,8 +1,8 @@
 package main
 
 // #include <stdlib.h>
-// typedef char* (*EventCallbackFn)(char*);
-// 
+// typedef char* (*EventCallbackFn)(const char*);
+//
 // // C helper function that does the casting for us
 // static inline char* callEventCallback(void* fn_ptr, char* input) {
 //   if (fn_ptr == NULL) return NULL;
@@ -10,7 +10,7 @@ package main
 //   return fn(input);
 // }
 import "C"
- 
+
 import (
 	"context"
 	"encoding/json"
@@ -244,23 +244,31 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			defer C.free(unsafe.Pointer(cEventJSON))
 
 			// Call the Julia callback function
-			responseJSON := C.GoString(C.callEventCallback(callback, cEventJSON))
+			cResponseJSON := C.callEventCallback(callback, cEventJSON)
 
-			// If we got a response directly from the callback
-			if responseJSON != "" {
-				var response ASGIResponse
-				if err := json.Unmarshal([]byte(responseJSON), &response); err == nil {
-					// Skip the channel and directly use the response
-					writeResponse(w, response)
+			// Check if we got a valid response
+			if cResponseJSON != nil {
+				// Convert to Go string and free the memory
+				responseJSON := C.GoString(cResponseJSON)
+				C.free(unsafe.Pointer(cResponseJSON)) // Free the memory allocated by Julia
 
-					// Clean up the pending request
-					pendingMu.Lock()
-					delete(pendingReqs, requestId)
-					pendingMu.Unlock()
+				// Check if the response is empty
+				if responseJSON != "" {
+					// Debug the received JSON
+					var response ASGIResponse
+					if err := json.Unmarshal([]byte(responseJSON), &response); err == nil {
+						// Skip the channel and directly use the response
+						writeResponse(w, response)
 
-					responseReceived = true
-				} else {
-					fmt.Printf("Error unmarshaling callback response: %v\n", err)
+						// Clean up the pending request
+						pendingMu.Lock()
+						delete(pendingReqs, requestId)
+						pendingMu.Unlock()
+
+						responseReceived = true
+					} else {
+						fmt.Printf("Error unmarshaling callback response: %v\nResponse content: %q\n", err, responseJSON)
+					}
 				}
 			}
 		} else {
@@ -307,7 +315,6 @@ func writeResponse(w http.ResponseWriter, response ASGIResponse) {
 	w.WriteHeader(response.Status)
 	w.Write(response.Body)
 }
-
 
 // getHeadersList converts HTTP headers to ASGI format (list of [key, value] pairs)
 func getHeadersList(r *http.Request) [][]string {
