@@ -13,9 +13,12 @@ import (
 // Global variables to manage the server state
 var (
 	server   *http.Server
-	eventsMu sync.Mutex
-	events   []ASGIEvent
 	serverMu sync.Mutex
+
+	// Event queue management using a channel-based approach for better performance
+	eventsCh      = make(chan ASGIEvent, 10000) // Buffered channel for better performance
+	eventsContext context.Context
+	eventsCancel  context.CancelFunc
 
 	// Pending responses mechanism
 	pendingMu    sync.Mutex
@@ -26,7 +29,7 @@ var (
 // ASGIEvent represents a standard ASGI event
 type ASGIEvent struct {
 	Type      string                 `json:"type"`
-	RequestId string                 `json:"request_id"` // Added request ID for tracking
+	RequestId string                 `json:"request_id"`
 	Scope     map[string]interface{} `json:"scope"`
 	Message   map[string]interface{} `json:"message"`
 	Time      time.Time              `json:"time"`
@@ -40,6 +43,14 @@ type ASGIResponse struct {
 	Body      []byte              `json:"body"`
 }
 
+func init() {
+	// Initialize the context for event management
+	eventsContext, eventsCancel = context.WithCancel(context.Background())
+
+	// Create a buffered event channel
+	eventsCh = make(chan ASGIEvent, 10000)
+}
+
 //export StartServer
 func StartServer(port int) *C.char {
 	serverMu.Lock()
@@ -49,10 +60,14 @@ func StartServer(port int) *C.char {
 		return C.CString("Server is already running")
 	}
 
-	// Initialize the event queue
-	eventsMu.Lock()
-	events = make([]ASGIEvent, 0)
-	eventsMu.Unlock()
+	// Create a fresh context for this server instance
+	if eventsCancel != nil {
+		eventsCancel()
+	}
+	eventsContext, eventsCancel = context.WithCancel(context.Background())
+
+	// Create a fresh event channel
+	eventsCh = make(chan ASGIEvent, 10000)
 
 	// Reset pending requests
 	pendingMu.Lock()
@@ -87,6 +102,11 @@ func StopServer() *C.char {
 		return C.CString("Server is not running")
 	}
 
+	// Signal any blocked GetEvents calls to return
+	if eventsCancel != nil {
+		eventsCancel()
+	}
+
 	// Create a context with a timeout for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -109,22 +129,43 @@ func StopServer() *C.char {
 
 //export GetEvents
 func GetEvents() *C.char {
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-
-	if len(events) == 0 {
+	// Fast path: check if context is already canceled
+	if eventsContext.Err() != nil {
 		return C.CString("[]")
 	}
 
-	jsonData, err := json.Marshal(events)
-	if err != nil {
-		return C.CString(fmt.Sprintf("Error marshaling events: %v", err))
+	// Wait for an event with timeout
+	select {
+	case event := <-eventsCh:
+		// We got an event
+		result := []ASGIEvent{event}
+
+		// Try to get more events without blocking (up to 10)
+		for i := 0; i < 9; i++ {
+			select {
+			case ev := <-eventsCh:
+				result = append(result, ev)
+			default:
+				// No more events available without blocking
+				break
+			}
+		}
+
+		// Marshal the events
+		jsonData, err := json.Marshal(result)
+		if err != nil {
+			return C.CString(fmt.Sprintf("Error marshaling events: %v", err))
+		}
+		return C.CString(string(jsonData))
+
+	case <-time.After(5 * time.Second):
+		// Timeout - return empty array
+		return C.CString("[]")
+
+	case <-eventsContext.Done():
+		// Server is stopping
+		return C.CString("[]")
 	}
-
-	// Clear the events after fetching
-	events = make([]ASGIEvent, 0)
-
-	return C.CString(string(jsonData))
 }
 
 //export SubmitResponse
@@ -167,13 +208,23 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Create an ASGI event from the HTTP request with the request ID
 	event := createASGIEvent(r, requestId)
 
-	// Store the event for Julia to process
-	eventsMu.Lock()
-	events = append(events, event)
-	eventsMu.Unlock()
+	// Send the event to the channel for Julia to process
+	select {
+	case eventsCh <- event:
+		// Event successfully queued
+	default:
+		// Channel is full, handle overflow (this prevents blocking)
+		fmt.Printf("Warning: Event channel is full, dropping oldest event\n")
+		// Remove oldest event and try again
+		select {
+		case <-eventsCh: // Remove oldest
+			eventsCh <- event // Try again
+		default:
+			// This should not happen but handles race conditions
+		}
+	}
 
 	// Wait for Julia to process the event and provide a response
-	// Include a timeout to prevent hanging forever
 	select {
 	case response := <-respChan:
 		// Clean up the pending request
@@ -192,7 +243,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(response.Status)
 		w.Write(response.Body)
 
-	// TODO: Customize timeout
 	case <-time.After(30 * time.Second):
 		// Timeout after waiting too long
 		pendingMu.Lock()
@@ -205,18 +255,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getHeadersList converts HTTP headers to ASGI format (list of [key, value] pairs)
-func getHeadersList(r *http.Request) [][]string {
-	headers := make([][]string, 0)
-	for name, values := range r.Header {
-		for _, value := range values {
-			headers = append(headers, []string{name, value})
-		}
-	}
-	// Add host header
-	headers = append(headers, []string{"host", r.Host})
-	return headers
-}
+// Functions from events.go would be used here...
+// generateRequestId(), createASGIEvent(), etc.
 
 func main() {
 	// This is needed for building a shared library

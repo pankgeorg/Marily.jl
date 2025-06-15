@@ -11,4 +11,4 @@ function my_handler(event)
 end
 
 # Start the server and process events
-Marily.run_server(8000, my_handler)
+Marily.run_server_threaded(8000, my_handler)
