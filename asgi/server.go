@@ -1,19 +1,30 @@
 package main
 
+// #include <stdlib.h>
+// typedef char* (*EventCallbackFn)(char*);
+// 
+// // C helper function that does the casting for us
+// static inline char* callEventCallback(void* fn_ptr, char* input) {
+//   if (fn_ptr == NULL) return NULL;
+//   EventCallbackFn fn = (EventCallbackFn)fn_ptr;
+//   return fn(input);
+// }
+import "C"
+ 
 import (
-	"C"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // Configuration constants
 const (
 	// Maximum number of concurrent requests to process
-	maxConcurrentRequests = 1000
+	maxConcurrentRequests = 100
 	// Request timeout in seconds
 	requestTimeout = 30
 )
@@ -21,9 +32,11 @@ const (
 // Global variables to manage the server state
 var (
 	server   *http.Server
-	eventsMu sync.Mutex
-	events   []ASGIEvent
 	serverMu sync.Mutex
+
+	// Event callback mechanism
+	eventCallbackMu sync.Mutex
+	eventCallback   unsafe.Pointer // Stores the Julia callback function
 
 	// Pending responses mechanism
 	pendingMu    sync.Mutex
@@ -52,6 +65,15 @@ type ASGIResponse struct {
 	Body      []byte              `json:"body"`
 }
 
+//export RegisterEventCallback
+func RegisterEventCallback(callback unsafe.Pointer) *C.char {
+	eventCallbackMu.Lock()
+	defer eventCallbackMu.Unlock()
+
+	eventCallback = callback
+	return C.CString("Event callback registered successfully")
+}
+
 //export StartServer
 func StartServer(port int) *C.char {
 	serverMu.Lock()
@@ -60,11 +82,6 @@ func StartServer(port int) *C.char {
 	if server != nil {
 		return C.CString("Server is already running")
 	}
-
-	// Initialize the event queue
-	eventsMu.Lock()
-	events = make([]ASGIEvent, 0)
-	eventsMu.Unlock()
 
 	// Reset pending requests
 	pendingMu.Lock()
@@ -133,24 +150,26 @@ func StopServer() *C.char {
 	return C.CString("Server stopped")
 }
 
-//export GetEvents
-func GetEvents() *C.char {
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-
-	if len(events) == 0 {
-		return C.CString("[]")
+//export GetConcurrentRequests
+func GetConcurrentRequests() *C.char {
+	// Count how many slots are available in the semaphore
+	available := 0
+	for i := 0; i < maxConcurrentRequests; i++ {
+		select {
+		case requestSemaphore <- struct{}{}:
+			available++
+		default:
+			break
+		}
 	}
 
-	jsonData, err := json.Marshal(events)
-	if err != nil {
-		return C.CString(fmt.Sprintf("Error marshaling events: %v", err))
+	// Return the tokens we just took
+	for i := 0; i < available; i++ {
+		<-requestSemaphore
 	}
 
-	// Clear the events after fetching
-	events = make([]ASGIEvent, 0)
-
-	return C.CString(string(jsonData))
+	inUse := maxConcurrentRequests - available
+	return C.CString(fmt.Sprintf("%d/%d concurrent requests active", inUse, maxConcurrentRequests))
 }
 
 //export SubmitResponse
@@ -188,7 +207,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			// Always release the token when done
 			<-requestSemaphore
 		}()
-	case <-time.After(30 * time.Second):
+	case <-time.After(5 * time.Second):
 		// Could not get a token within timeout, server is overloaded
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte("Server is at capacity, please try again later"))
@@ -209,42 +228,86 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Create an ASGI event from the HTTP request with the request ID
 	event := createASGIEvent(r, requestId)
 
-	// Store the event for Julia to process
-	eventsMu.Lock()
-	events = append(events, event)
-	eventsMu.Unlock()
+	// Check if we have a callback registered
+	eventCallbackMu.Lock()
+	callback := eventCallback
+	eventCallbackMu.Unlock()
 
-	// Wait for Julia to process the event and provide a response
-	// Include a timeout to prevent hanging forever
-	select {
-	case response := <-respChan:
-		// Clean up the pending request
-		pendingMu.Lock()
-		delete(pendingReqs, requestId)
-		pendingMu.Unlock()
+	var responseReceived bool
 
-		// Write the response headers
-		for key, values := range response.Headers {
-			for _, value := range values {
-				w.Header().Add(key, value)
+	if callback != nil {
+		// Convert event to JSON
+		eventJSON, err := json.Marshal(event)
+		if err == nil {
+			// Call the Julia callback directly with the event
+			cEventJSON := C.CString(string(eventJSON))
+			defer C.free(unsafe.Pointer(cEventJSON))
+
+			// Call the Julia callback function
+			responseJSON := C.GoString(C.callEventCallback(callback, cEventJSON))
+
+			// If we got a response directly from the callback
+			if responseJSON != "" {
+				var response ASGIResponse
+				if err := json.Unmarshal([]byte(responseJSON), &response); err == nil {
+					// Skip the channel and directly use the response
+					writeResponse(w, response)
+
+					// Clean up the pending request
+					pendingMu.Lock()
+					delete(pendingReqs, requestId)
+					pendingMu.Unlock()
+
+					responseReceived = true
+				} else {
+					fmt.Printf("Error unmarshaling callback response: %v\n", err)
+				}
 			}
+		} else {
+			fmt.Printf("Error marshaling event: %v\n", err)
 		}
+	}
 
-		// Write the status code and body
-		w.WriteHeader(response.Status)
-		w.Write(response.Body)
+	// If we didn't get a direct response from the callback, wait on the channel
+	if !responseReceived {
+		// Wait for Julia to process the event and provide a response
+		// Include a timeout to prevent hanging forever
+		select {
+		case response := <-respChan:
+			// Clean up the pending request
+			pendingMu.Lock()
+			delete(pendingReqs, requestId)
+			pendingMu.Unlock()
 
-	case <-time.After(time.Duration(requestTimeout) * time.Second):
-		// Timeout after waiting too long
-		pendingMu.Lock()
-		delete(pendingReqs, requestId)
-		close(respChan)
-		pendingMu.Unlock()
+			writeResponse(w, response)
 
-		w.WriteHeader(http.StatusGatewayTimeout)
-		w.Write([]byte("Request timed out waiting for processing"))
+		case <-time.After(time.Duration(requestTimeout) * time.Second):
+			// Timeout after waiting too long
+			pendingMu.Lock()
+			delete(pendingReqs, requestId)
+			close(respChan)
+			pendingMu.Unlock()
+
+			w.WriteHeader(http.StatusGatewayTimeout)
+			w.Write([]byte("Request timed out waiting for processing"))
+		}
 	}
 }
+
+// Helper function to write the response to the HTTP writer
+func writeResponse(w http.ResponseWriter, response ASGIResponse) {
+	// Write the response headers
+	for key, values := range response.Headers {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Write the status code and body
+	w.WriteHeader(response.Status)
+	w.Write(response.Body)
+}
+
 
 // getHeadersList converts HTTP headers to ASGI format (list of [key, value] pairs)
 func getHeadersList(r *http.Request) [][]string {

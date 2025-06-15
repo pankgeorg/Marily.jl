@@ -19,6 +19,18 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 /* Start of preamble from import "C" comments.  */
 
 
+#line 3 "server.go"
+ #include <stdlib.h>
+ typedef char* (*EventCallbackFn)(char*);
+ 
+ // C helper function that does the casting for us
+ static inline char* callEventCallback(void* fn_ptr, char* input) {
+   if (fn_ptr == NULL) return NULL;
+   EventCallbackFn fn = (EventCallbackFn)fn_ptr;
+   return fn(input);
+ }
+
+#line 1 "cgo-generated-wrapper"
 
 
 /* End of preamble from import "C" comments.  */
@@ -74,9 +86,10 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern char* RegisterEventCallback(void* callback);
 extern char* StartServer(GoInt port);
 extern char* StopServer();
-extern char* GetEvents();
+extern char* GetConcurrentRequests();
 extern char* SubmitResponse(char* responseJson);
 
 #ifdef __cplusplus
