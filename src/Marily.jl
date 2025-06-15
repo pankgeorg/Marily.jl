@@ -2,7 +2,7 @@ module Marily
 
 using JSON3
 
-export start_server, stop_server, submit_response, register_event_handler, run_server
+export start_server, stop_server, register_event_handler, run_server
 
 # Load the shared object file
 const libpath = joinpath(@__DIR__, "../asgi/libasgi.so")
@@ -126,41 +126,6 @@ function stop_server()
     message = unsafe_string(result)
     Libc.free(result)
     return message
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-
-Submit a response for a specific request back to the Go server.
-Note: This is kept for compatibility but may not be needed with the callback approach.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-    # Create the response object
-    response = Dict(
-        "request_id" => request_id,
-        "status" => status,
-        "headers" => headers,
-        "body" => body
-    )
-
-    # Convert to JSON
-    json_response = JSON3.write(response)
-
-    # Call the Go function
-    result = ccall((:SubmitResponse, libpath), Cstring, (Cstring,), json_response)
-    message = unsafe_string(result)
-    Libc.free(result)
-
-    return message
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::String)
-
-Convenience method that takes a string body instead of raw bytes.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::String)
-    submit_response(request_id, status, headers, Vector{UInt8}(body))
 end
 
 """

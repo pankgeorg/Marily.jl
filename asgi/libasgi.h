@@ -90,7 +90,6 @@ extern char* RegisterEventCallback(void* callback);
 extern char* StartServer(GoInt port);
 extern char* StopServer();
 extern char* GetConcurrentRequests();
-extern char* SubmitResponse(char* responseJson);
 
 #ifdef __cplusplus
 }
