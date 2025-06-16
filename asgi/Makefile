@@ -1,2 +1,2 @@
-libasgi.so: events.go server.go
+libasgi.so: server.go
 	go build -buildmode=c-shared -o libasgi.so .
