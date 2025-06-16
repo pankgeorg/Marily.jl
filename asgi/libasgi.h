@@ -176,7 +176,7 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-extern char* RegisterEventCallback(asgi_callback_fn callback);
+extern char* RegisterEventCallback(char* path, asgi_callback_fn callback);
 extern char* StartServer(GoInt port);
 extern char* StopServer();
 extern char* GetConcurrentRequests();
