@@ -14,9 +14,9 @@ my_handler1 = process_event_callback(my_handler)
 my_handler2 = process_event_callback(function (event)
     return (200, Dict("Content-Type" => ["text/plain"]), "Another path response")
 end)
-# Start the server and process events
 Marily.register_path_handler("POST /another_path", my_handler2)
 
 Marily.register_path_handler("localhost:8000/path2", my_handler2)
 
+# Start the server and process events
 Marily.run_server(8000, my_handler1)

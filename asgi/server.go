@@ -305,7 +305,7 @@ func RegisterEventCallback(path *C.char, callback C.asgi_callback_fn) *C.char {
 
 	// Add handler to the global mux if needed
 	globalMux.HandleFunc(pathStr, handleRequestWithCallback(callback))
-
+	fmt.Print("Event callback registered for path: ", pathStr, "\n")
 	return C.CString(fmt.Sprintf("Event callback registered for path: %s", pathStr))
 }
 
