@@ -1,13 +1,13 @@
 module Marily
 
-export start_server, stop_server, register_event_handler, run_server
+export start_server, stop_server, register_event_handler, register_path_handler, run_server
 
 # Load the shared object file
 const libpath = joinpath(@__DIR__, "../asgi/libasgi.so")
 
-# Global storage for the event handler callback
-global event_handler_func = nothing
-global event_callback_ptr = C_NULL
+# Global storage for the event handler callbacks
+global event_handlers = Dict{String,Function}()
+global event_callback_ptrs = Dict{String,Ptr{Cvoid}}()
 
 # Thread safety for callback registration
 const callback_lock = ReentrantLock()
@@ -162,134 +162,160 @@ end
 C-callable function that processes an ASGI event received from Go.
 This is the function that Go will call directly when an event occurs.
 """
-function process_event_callback(event_ptr::Ptr{AsgiEvent})::Ptr{AsgiResponse}
-    try
-        # Load the event struct
-        event = unsafe_load(event_ptr)
+function process_event_callback(handler)
+    return function (event_ptr::Ptr{AsgiEvent})
+        try
+            # Load the event struct
+            event = unsafe_load(event_ptr)
 
-        # Check if we have a handler registered
-        if event_handler_func === nothing
-            return C_NULL
-        end
+            # Extract path to determine which handler to use
+            path = read_asgi_string(event.path)
 
-        # Extract fields from the event
-        request_id = read_asgi_string(event.request_id)
-        method = read_asgi_string(event.method)
-        path = read_asgi_string(event.path)
-        query_string = read_asgi_string(event.query_string)
-        scheme = read_asgi_string(event.scheme)
+            # Find the appropriate handler for this path
 
-        # Extract headers
-        headers = Dict{String,Vector{String}}()
-        for i in 0:(event.headers_count-1)
-            header_ptr = event.headers + i * sizeof(AsgiHeader)
-            header = unsafe_load(convert(Ptr{AsgiHeader}, header_ptr))
-            name = read_asgi_string(header.name)
-            value = read_asgi_string(header.value)
-
-            if !haskey(headers, name)
-                headers[name] = String[]
+            # Check if we have a handler registered
+            if handler === nothing
+                @warn "No handler found for path: $path"
+                return C_NULL
             end
-            push!(headers[name], value)
-        end
 
-        # Extract client and server info
-        client = ["unknown", "0"]
-        if event.client != C_NULL
-            client_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client)))
-            client_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client + sizeof(AsgiString))))
-            client = [client_host, client_port]
-        end
+            # Extract fields from the event
+            request_id = read_asgi_string(event.request_id)
+            method = read_asgi_string(event.method)
+            query_string = read_asgi_string(event.query_string)
+            scheme = read_asgi_string(event.scheme)
 
-        server = ["localhost", "80"]
-        if event.server != C_NULL
-            server_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server)))
-            server_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server + sizeof(AsgiString))))
-            server = [server_host, server_port]
-        end
+            # Extract headers
+            headers = Dict{String,Vector{String}}()
+            for i in 0:(event.headers_count-1)
+                header_ptr = event.headers + i * sizeof(AsgiHeader)
+                header = unsafe_load(convert(Ptr{AsgiHeader}, header_ptr))
+                name = read_asgi_string(header.name)
+                value = read_asgi_string(header.value)
 
-        # Extract body
-        body = UInt8[]
-        if event.body != C_NULL && event.body_length > 0
-            body = unsafe_wrap(Array, convert(Ptr{UInt8}, event.body), Int(event.body_length), own=false)
-            # Make a copy since we don't own the memory
-            body = copy(body)
-        end
+                if !haskey(headers, name)
+                    headers[name] = String[]
+                end
+                push!(headers[name], value)
+            end
 
-        # Build scope
-        scope = Dict(
-            "type" => "http",
-            "http_version" => "1.1",
-            "method" => method,
-            "scheme" => scheme,
-            "path" => path,
-            "query_string" => query_string,
-            "headers" => headers,
-            "client" => client,
-            "server" => server
-        )
+            # Extract client and server info
+            client = ["unknown", "0"]
+            if event.client != C_NULL
+                client_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client)))
+                client_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client + sizeof(AsgiString))))
+                client = [client_host, client_port]
+            end
 
-        # Build message
-        message = Dict(
-            "body" => body,
-            "more_body" => event.more_body !== Cint(0)
-        )
+            server = ["localhost", "80"]
+            if event.server != C_NULL
+                server_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server)))
+                server_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server + sizeof(AsgiString))))
+                server = [server_host, server_port]
+            end
 
-        # Build event object
-        event_obj = Dict(
-            "type" => "http.request",
-            "request_id" => request_id,
-            "scope" => scope,
-            "message" => message
-        )
+            # Extract body
+            body = UInt8[]
+            if event.body != C_NULL && event.body_length > 0
+                body = unsafe_wrap(Array, convert(Ptr{UInt8}, event.body), Int(event.body_length), own=false)
+                # Make a copy since we don't own the memory
+                body = copy(body)
+            end
 
-        # Call the handler
-        response = event_handler_func(event_obj)
+            # Build scope
+            scope = Dict(
+                "type" => "http",
+                "http_version" => "1.1",
+                "method" => method,
+                "scheme" => scheme,
+                "path" => path,
+                "query_string" => query_string,
+                "headers" => headers,
+                "client" => client,
+                "server" => server
+            )
 
-        # If no response is needed or handler returned nothing
-        if response === nothing
+            # Build message
+            message = Dict(
+                "body" => body,
+                "more_body" => event.more_body !== Cint(0)
+            )
+
+            # Build event object
+            event_obj = Dict(
+                "type" => "http.request",
+                "request_id" => request_id,
+                "scope" => scope,
+                "message" => message
+            )
+
+            # Call the handler
+            response = handler(event_obj)
+
+            # If no response is needed or handler returned nothing
+            if response === nothing
+                return C_NULL
+            end
+
+            # Extract response components
+            status, headers, body = response
+
+            # Convert body to vector of bytes if it's a string
+            if body isa String
+                body = Vector{UInt8}(body)
+            end
+
+            # Create and return the response
+            return make_asgi_response(request_id, status, headers, body)
+
+        catch e
+            # Handle any errors in the callback
+            @error "Error in Julia callback" exception = (e, catch_backtrace())
             return C_NULL
+        finally
+            ccall((:freeAsgiEvent, libpath), Cvoid, (Ptr{AsgiEvent},), event_ptr)
         end
-
-        # Extract response components
-        status, headers, body = response
-
-        # Convert body to vector of bytes if it's a string
-        if body isa String
-            body = Vector{UInt8}(body)
-        end
-
-        # Create and return the response
-        return make_asgi_response(request_id, status, headers, body)
-
-    catch e
-        # Handle any errors in the callback
-        @error "Error in Julia callback" exception = (e, catch_backtrace())
-        return C_NULL
     end
+end
+
+"""
+    register_path_handler(path::String, handler::Function)
+
+Register a callback function for a specific path.
+The handler should accept an event and return a tuple of (status, headers, body) or nothing.
+
+Path can end with /* to match all paths with that prefix.
+"""
+function register_path_handler(path::String, handler)
+
+    # Warning! If the function is not precompiled,
+    # calling it _twice_ from go will lead to either a segmentation
+    # fault and/or a deadlock, as the julia runtime will be 
+    # precompiling, but go will be hammering that function pointer
+    # nonetheless
+
+    precompile(handler, (Ptr{AsgiEvent},))
+    c_handler = @cfunction($handler, Ptr{AsgiResponse}, (Ptr{AsgiEvent},))
+    # Register the callback with Go for this path
+    path_cstr = Base.unsafe_convert(Cstring, Base.cconvert(Cstring, path))
+    result = ccall((:RegisterEventCallback, libpath), Cstring,
+        (Cstring, Ptr{Cvoid}),
+        path_cstr, c_handler)
+
+    message = unsafe_string(result)
+    Libc.free(result)
+    @info message
+    return message
 end
 
 """
     register_event_handler(handler::Function)
 
-Register a callback function that will be directly called by Go when an ASGI event is received.
-The handler should accept an event and return a tuple of (status, headers, body) or nothing.
+Register a callback function for the root path (/).
+This is a convenience function that calls register_path_handler("/", handler).
 """
 function register_event_handler(handler::Function)
-    lock(callback_lock) do
-        global event_handler_func = handler
-
-        # Create a C-callable function that will invoke our handler
-        c_handler = @cfunction(process_event_callback, Ptr{AsgiResponse}, (Ptr{AsgiEvent},))
-        global event_callback_ptr = c_handler
-
-        # Register the callback with Go
-        result = ccall((:RegisterEventCallback, libpath), Cstring, (Ptr{Cvoid},), c_handler)
-        message = unsafe_string(result)
-        Libc.free(result)
-
-        return message
-    end
+    return register_path_handler("/", handler)
 end
 
 """
