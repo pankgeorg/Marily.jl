@@ -1,16 +1,294 @@
 module Marily
 
-using JSON3
-
-export start_server, stop_server, get_events, process_events, submit_response
+export start_server, stop_server, register_event_handler, run_server
 
 # Load the shared object file
 const libpath = joinpath(@__DIR__, "../asgi/libasgi.so")
+
+# Global storage for the event handler callback
+global event_handler_func = nothing
+global event_callback_ptr = C_NULL
+
+# Thread safety for callback registration
+const callback_lock = ReentrantLock()
+
+# Define the C struct types to match asgi_structs.h exactly
+struct AsgiString
+    data::Ptr{Cchar}
+    length::Csize_t
+end
+
+struct AsgiHeader
+    name::AsgiString
+    value::AsgiString
+end
+
+struct AsgiEvent
+    request_id::AsgiString
+    method::AsgiString
+    path::AsgiString
+    query_string::AsgiString
+    scheme::AsgiString
+    headers::Ptr{AsgiHeader}
+    headers_count::Csize_t
+    client::Ptr{AsgiString}
+    server::Ptr{AsgiString}
+    body::Ptr{Cuchar}
+    body_length::Csize_t
+    more_body::Cint
+end
+
+struct AsgiResponse
+    request_id::AsgiString
+    status::Cint
+    headers::Ptr{AsgiHeader}
+    headers_count::Csize_t
+    body::Ptr{Cuchar}
+    body_length::Csize_t
+end
 
 function __init__()
     # Ensure the library exists
     if !isfile(libpath)
         error("Cannot find ASGI Go library at $libpath")
+    end
+end
+
+# Helper to create an AsgiString
+function make_asgi_string(str::String)
+    # Convert to array of bytes (UInt8) to ensure type compatibility
+    bytes = Vector{UInt8}(str)
+
+    # Allocate memory for the string data (+1 for null terminator)
+    data = Base.Libc.malloc(length(bytes) + 1)
+
+    # Convert to correct pointer type for copyto!
+    data_ptr = convert(Ptr{UInt8}, data)
+
+    # Copy the string data
+    unsafe_copyto!(data_ptr, pointer(bytes), length(bytes))
+
+    # Add null terminator
+    unsafe_store!(data_ptr + length(bytes), 0x00)
+
+    # Return the AsgiString structure
+    return AsgiString(convert(Ptr{Cchar}, data), length(bytes))
+end
+
+# Helper to read an AsgiString to a Julia String
+function read_asgi_string(str::AsgiString)
+    if str.data == C_NULL || str.length == 0
+        return ""
+    end
+    return unsafe_string(str.data, Int(str.length))
+end
+
+# Helper to create headers array
+function make_asgi_headers(headers::Dict)
+    count = 0
+    for (_, values) in headers
+        count += length(values)
+    end
+
+    if count == 0
+        return (C_NULL, 0)
+    end
+
+    headers_ptr = Base.Libc.malloc(count * sizeof(AsgiHeader))
+    idx = 0
+
+    for (name, values) in headers
+        for value in values
+            header_ptr = convert(Ptr{Nothing}, headers_ptr + idx * sizeof(AsgiHeader))
+            name_asgi = make_asgi_string(String(name))
+            value_asgi = make_asgi_string(String(value))
+
+            # Store the name
+            unsafe_store!(Ptr{AsgiString}(header_ptr), name_asgi)
+
+            # Store the value
+            value_offset = fieldoffset(AsgiHeader, 2)
+            unsafe_store!(Ptr{AsgiString}(header_ptr + value_offset), value_asgi)
+
+            idx += 1
+        end
+    end
+
+    return (convert(Ptr{AsgiHeader}, headers_ptr), Csize_t(count))
+end
+
+# Helper to create an AsgiResponse
+function make_asgi_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
+    # Create the response struct
+    response_ptr = Base.Libc.malloc(sizeof(AsgiResponse))
+
+    # Set request_id
+    req_id_asgi = make_asgi_string(request_id)
+    unsafe_store!(Ptr{AsgiString}(response_ptr), req_id_asgi)
+
+    # Set status
+    status_offset = fieldoffset(AsgiResponse, 2)
+    unsafe_store!(Ptr{Cint}(response_ptr + status_offset), Cint(status))
+
+    # Set headers
+    headers_ptr, headers_count = make_asgi_headers(headers)
+    headers_ptr_offset = fieldoffset(AsgiResponse, 3)
+    headers_count_offset = fieldoffset(AsgiResponse, 4)
+    unsafe_store!(Ptr{Ptr{AsgiHeader}}(response_ptr + headers_ptr_offset), headers_ptr)
+    unsafe_store!(Ptr{Csize_t}(response_ptr + headers_count_offset), headers_count)
+
+    # Set body
+    body_ptr_offset = fieldoffset(AsgiResponse, 5)
+    body_length_offset = fieldoffset(AsgiResponse, 6)
+
+    if !isempty(body)
+        body_ptr = Base.Libc.malloc(length(body))
+        # Convert to correct pointer type for copyto!
+        data_ptr = convert(Ptr{UInt8}, body_ptr)
+        unsafe_copyto!(data_ptr, pointer(body), length(body))
+        unsafe_store!(Ptr{Ptr{Cuchar}}(response_ptr + body_ptr_offset), convert(Ptr{Cuchar}, body_ptr))
+        unsafe_store!(Ptr{Csize_t}(response_ptr + body_length_offset), Csize_t(length(body)))
+    else
+        unsafe_store!(Ptr{Ptr{Cuchar}}(response_ptr + body_ptr_offset), C_NULL)
+        unsafe_store!(Ptr{Csize_t}(response_ptr + body_length_offset), Csize_t(0))
+    end
+
+    return convert(Ptr{AsgiResponse}, response_ptr)
+end
+
+"""
+    process_event_callback(event_ptr::Ptr{AsgiEvent})::Ptr{AsgiResponse}
+
+C-callable function that processes an ASGI event received from Go.
+This is the function that Go will call directly when an event occurs.
+"""
+function process_event_callback(event_ptr::Ptr{AsgiEvent})::Ptr{AsgiResponse}
+    try
+        # Load the event struct
+        event = unsafe_load(event_ptr)
+
+        # Check if we have a handler registered
+        if event_handler_func === nothing
+            return C_NULL
+        end
+
+        # Extract fields from the event
+        request_id = read_asgi_string(event.request_id)
+        method = read_asgi_string(event.method)
+        path = read_asgi_string(event.path)
+        query_string = read_asgi_string(event.query_string)
+        scheme = read_asgi_string(event.scheme)
+
+        # Extract headers
+        headers = Dict{String,Vector{String}}()
+        for i in 0:(event.headers_count-1)
+            header_ptr = event.headers + i * sizeof(AsgiHeader)
+            header = unsafe_load(convert(Ptr{AsgiHeader}, header_ptr))
+            name = read_asgi_string(header.name)
+            value = read_asgi_string(header.value)
+
+            if !haskey(headers, name)
+                headers[name] = String[]
+            end
+            push!(headers[name], value)
+        end
+
+        # Extract client and server info
+        client = ["unknown", "0"]
+        if event.client != C_NULL
+            client_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client)))
+            client_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.client + sizeof(AsgiString))))
+            client = [client_host, client_port]
+        end
+
+        server = ["localhost", "80"]
+        if event.server != C_NULL
+            server_host = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server)))
+            server_port = read_asgi_string(unsafe_load(convert(Ptr{AsgiString}, event.server + sizeof(AsgiString))))
+            server = [server_host, server_port]
+        end
+
+        # Extract body
+        body = UInt8[]
+        if event.body != C_NULL && event.body_length > 0
+            body = unsafe_wrap(Array, convert(Ptr{UInt8}, event.body), Int(event.body_length), own=false)
+            # Make a copy since we don't own the memory
+            body = copy(body)
+        end
+
+        # Build scope
+        scope = Dict(
+            "type" => "http",
+            "http_version" => "1.1",
+            "method" => method,
+            "scheme" => scheme,
+            "path" => path,
+            "query_string" => query_string,
+            "headers" => headers,
+            "client" => client,
+            "server" => server
+        )
+
+        # Build message
+        message = Dict(
+            "body" => body,
+            "more_body" => event.more_body !== Cint(0)
+        )
+
+        # Build event object
+        event_obj = Dict(
+            "type" => "http.request",
+            "request_id" => request_id,
+            "scope" => scope,
+            "message" => message
+        )
+
+        # Call the handler
+        response = event_handler_func(event_obj)
+
+        # If no response is needed or handler returned nothing
+        if response === nothing
+            return C_NULL
+        end
+
+        # Extract response components
+        status, headers, body = response
+
+        # Convert body to vector of bytes if it's a string
+        if body isa String
+            body = Vector{UInt8}(body)
+        end
+
+        # Create and return the response
+        return make_asgi_response(request_id, status, headers, body)
+
+    catch e
+        # Handle any errors in the callback
+        @error "Error in Julia callback" exception = (e, catch_backtrace())
+        return C_NULL
+    end
+end
+
+"""
+    register_event_handler(handler::Function)
+
+Register a callback function that will be directly called by Go when an ASGI event is received.
+The handler should accept an event and return a tuple of (status, headers, body) or nothing.
+"""
+function register_event_handler(handler::Function)
+    lock(callback_lock) do
+        global event_handler_func = handler
+
+        # Create a C-callable function that will invoke our handler
+        c_handler = @cfunction(process_event_callback, Ptr{AsgiResponse}, (Ptr{AsgiEvent},))
+        global event_callback_ptr = c_handler
+
+        # Register the callback with Go
+        result = ccall((:RegisterEventCallback, libpath), Cstring, (Ptr{Cvoid},), c_handler)
+        message = unsafe_string(result)
+        Libc.free(result)
+
+        return message
     end
 end
 
@@ -39,109 +317,24 @@ function stop_server()
 end
 
 """
-    get_events()
+    run_server(port::Int, handler::Function)
 
-Retrieve all ASGI events from the server and clear the event queue.
-Returns a Vector of event dictionaries.
+Run the server with the provided event handler.
+This is a simplified interface that registers the handler and starts the server.
 """
-function get_events()
-    result = ccall((:GetEvents, libpath), Cstring, ())
-    json_str = unsafe_string(result)
-    Libc.free(result)
+function run_server(port::Int, handler::Function)
+    # Register the handler
+    register_message = register_event_handler(handler)
+    @info "Registered event handler: $register_message"
 
-    if json_str == "[]"
-        return []
-    end
+    # Start the server
+    start_message = start_server(port)
+    @info "Started server: $start_message"
 
-    # Parse JSON string into Julia objects
-    return JSON3.read(json_str)
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-
-Submit a response for a specific request back to the Go server.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::Vector{UInt8})
-    # Create the response object
-    response = Dict(
-        "request_id" => request_id,
-        "status" => status,
-        "headers" => headers,
-        "body" => body
-    )
-
-    # Convert to JSON
-    json_response = JSON3.write(response)
-
-    # Call the Go function
-    result = ccall((:SubmitResponse, libpath), Cstring, (Cstring,), json_response)
-    message = unsafe_string(result)
-    Libc.free(result)
-
-    return message
-end
-
-"""
-    submit_response(request_id::String, status::Int, headers::Dict, body::String)
-
-Convenience method that takes a string body instead of raw bytes.
-"""
-function submit_response(request_id::String, status::Int, headers::Dict, body::String)
-    submit_response(request_id, status, headers, Vector{UInt8}(body))
-end
-
-"""
-    process_events(handler::Function)
-
-Process all pending ASGI events with the provided handler function.
-The handler should accept an event and return a tuple of (status, headers, body)
-or nothing if no response is needed.
-"""
-function process_events(handler::Function)
-    events = get_events()
-    if isempty(events)
-        return 0
-    end
-
-    processed = 0
-    for event in events
-        # Handle each event
-        response = handler(event)
-
-        # If the handler returned a response, submit it
-        if response !== nothing
-            request_id = event.request_id
-            status, headers, body = response
-            submit_response(request_id, status, headers, body)
-            processed += 1
-        end
-    end
-
-    return processed
-end
-
-"""
-    process_events_async(handler::Function)
-
-Process events asynchronously in a separate task.
-Returns a task handle that can be waited on if needed.
-"""
-function process_events_async(handler::Function)
-    return @async process_events(handler)
-end
-
-"""
-    run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
-
-Run the server and process events in a loop until interrupted.
-"""
-function run_server(port::Int, handler::Function; polling_interval::Float64=0.0)
-    start_server(port)
     try
+        # Keep the Julia process running
         while true
-            process_events(handler)
-            polling_interval > 0 && sleep(polling_interval)
+            sleep(1)
         end
     catch e
         if isa(e, InterruptException)

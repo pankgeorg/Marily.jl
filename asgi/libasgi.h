@@ -19,6 +19,108 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 /* Start of preamble from import "C" comments.  */
 
 
+#line 3 "server.go"
+ #include <stdlib.h>
+ #include <string.h>
+ #include "asgi_structs.h"
+
+ // Helper function to create an asgi_string
+ static inline asgi_string make_asgi_string(const char* str) {
+     asgi_string result;
+     if (str == NULL) {
+         result.data = NULL;
+         result.length = 0;
+     } else {
+         size_t len = strlen(str);
+         result.data = (char*)malloc(len + 1);
+         strcpy(result.data, str);
+         result.length = len;
+     }
+     return result;
+ }
+
+ // Helper to free an asgi_string
+ static inline void free_asgi_string(asgi_string str) {
+     if (str.data != NULL) {
+         free(str.data);
+     }
+ }
+
+ // Helper to free an asgi_event
+ static inline void free_asgi_event(asgi_event* event) {
+     if (event == NULL) return;
+
+     free_asgi_string(event->request_id);
+     free_asgi_string(event->method);
+     free_asgi_string(event->path);
+     free_asgi_string(event->query_string);
+     free_asgi_string(event->scheme);
+
+     // Free headers
+     for (size_t i = 0; i < event->headers_count; i++) {
+         free_asgi_string(event->headers[i].name);
+         free_asgi_string(event->headers[i].value);
+     }
+     if (event->headers != NULL) {
+         free(event->headers);
+     }
+
+     // Free client
+     if (event->client != NULL) {
+         // Access client array elements by pointer arithmetic
+         free_asgi_string(*(asgi_string*)((char*)event->client));
+         free_asgi_string(*(asgi_string*)((char*)event->client + sizeof(asgi_string)));
+         free(event->client);
+     }
+
+     // Free server
+     if (event->server != NULL) {
+         // Access server array elements by pointer arithmetic
+         free_asgi_string(*(asgi_string*)((char*)event->server));
+         free_asgi_string(*(asgi_string*)((char*)event->server + sizeof(asgi_string)));
+         free(event->server);
+     }
+
+     // Free body
+     if (event->body != NULL) {
+         free(event->body);
+     }
+
+     // Free the event itself
+     free(event);
+ }
+
+ // Helper to free an asgi_response
+ static inline void free_asgi_response(asgi_response* response) {
+     if (response == NULL) return;
+
+     free_asgi_string(response->request_id);
+
+     // Free headers
+     for (size_t i = 0; i < response->headers_count; i++) {
+         free_asgi_string(response->headers[i].name);
+         free_asgi_string(response->headers[i].value);
+     }
+     if (response->headers != NULL) {
+         free(response->headers);
+     }
+
+     // Free body
+     if (response->body != NULL) {
+         free(response->body);
+     }
+
+     // Free the response itself
+     free(response);
+ }
+
+ // C helper function that calls the callback safely
+ static inline asgi_response* call_event_callback(asgi_callback_fn callback, asgi_event* event) {
+     if (callback == NULL) return NULL;
+     return callback(event);
+ }
+
+#line 1 "cgo-generated-wrapper"
 
 
 /* End of preamble from import "C" comments.  */
@@ -74,10 +176,10 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern char* RegisterEventCallback(asgi_callback_fn callback);
 extern char* StartServer(GoInt port);
 extern char* StopServer();
-extern char* GetEvents();
-extern char* SubmitResponse(char* responseJson);
+extern char* GetConcurrentRequests();
 
 #ifdef __cplusplus
 }
