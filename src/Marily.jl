@@ -272,6 +272,8 @@ function process_event_callback(handler)
             # Handle any errors in the callback
             @error "Error in Julia callback" exception = (e, catch_backtrace())
             return C_NULL
+        finally
+            ccall((:freeAsgiEvent, libpath), Cvoid, (Ptr{AsgiEvent},), event_ptr)
         end
     end
 end
