@@ -13,6 +13,7 @@ package main
 //     } else {
 //         size_t len = strlen(str);
 //         result.data = (char*)malloc(len + 1);
+//         result.data[len] = (char) '\0';
 //         strcpy(result.data, str);
 //         result.length = len;
 //     }
@@ -189,6 +190,11 @@ func headersToAsgiHeaders(headers http.Header) (*C.asgi_header, C.size_t) {
 	}
 
 	return asgiHeaders, C.size_t(count)
+}
+
+//export freeAsgiEvent
+func freeAsgiEvent(event *C.asgi_event) {
+	C.free_asgi_event(event)
 }
 
 // createAsgiEvent converts an HTTP request to a C asgi_event
@@ -422,7 +428,7 @@ func handleRequestWithCallback(callback C.asgi_callback_fn) http.HandlerFunc {
 
 		// Create a C asgi_event from the HTTP request
 		cEvent := createAsgiEvent(r, requestId)
-		defer C.free_asgi_event(cEvent)
+		// defer C.free_asgi_event(cEvent)
 
 		// Set up a timeout for the callback
 		var cResponse *C.asgi_response
