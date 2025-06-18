@@ -287,6 +287,14 @@ The handler should accept an event and return a tuple of (status, headers, body)
 Path can end with /* to match all paths with that prefix.
 """
 function register_path_handler(path::String, handler)
+
+    # Warning! If the function is not precompiled,
+    # calling it _twice_ from go will lead to either a segmentation
+    # fault and/or a deadlock, as the julia runtime will be 
+    # precompiling, but go will be hammering that function pointer
+    # nonetheless
+
+    precompile(handler, (Ptr{AsgiEvent},))
     c_handler = @cfunction($handler, Ptr{AsgiResponse}, (Ptr{AsgiEvent},))
     # Register the callback with Go for this path
     path_cstr = Base.unsafe_convert(Cstring, Base.cconvert(Cstring, path))

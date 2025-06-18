@@ -117,7 +117,7 @@ import (
 // Configuration constants
 const (
 	// Maximum number of concurrent requests to process
-	maxConcurrentRequests = 1000
+	maxConcurrentRequests = 4
 	// Request timeout for callback in seconds
 	callbackTimeout = 30
 )
@@ -428,6 +428,7 @@ func handleRequestWithCallback(callback C.asgi_callback_fn) http.HandlerFunc {
 
 		// Create a C asgi_event from the HTTP request
 		cEvent := createAsgiEvent(r, requestId)
+		// We give this responsibility to julia nowadays
 		// defer C.free_asgi_event(cEvent)
 
 		// Set up a timeout for the callback
