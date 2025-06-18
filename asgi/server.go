@@ -13,6 +13,7 @@ package main
 //     } else {
 //         size_t len = strlen(str);
 //         result.data = (char*)malloc(len + 1);
+//         result.data[len] = (char) '\0';
 //         strcpy(result.data, str);
 //         result.length = len;
 //     }
@@ -126,9 +127,12 @@ var (
 	server   *http.Server
 	serverMu sync.Mutex
 
-	// Event callback mechanism
-	eventCallbackMu sync.Mutex
-	eventCallback   C.asgi_callback_fn // Stores the Julia callback function
+	// Global router/multiplexer
+	globalMux = http.NewServeMux()
+
+	// Path-to-callback mapping
+	callbacksMu sync.RWMutex
+	callbacks   = make(map[string]C.asgi_callback_fn)
 
 	// Request ID generation
 	requestIdSeq int64 = 0
@@ -186,6 +190,11 @@ func headersToAsgiHeaders(headers http.Header) (*C.asgi_header, C.size_t) {
 	}
 
 	return asgiHeaders, C.size_t(count)
+}
+
+//export freeAsgiEvent
+func freeAsgiEvent(event *C.asgi_event) {
+	C.free_asgi_event(event)
 }
 
 // createAsgiEvent converts an HTTP request to a C asgi_event
@@ -297,12 +306,13 @@ func writeResponseFromC(w http.ResponseWriter, response *C.asgi_response) {
 }
 
 //export RegisterEventCallback
-func RegisterEventCallback(callback C.asgi_callback_fn) *C.char {
-	eventCallbackMu.Lock()
-	defer eventCallbackMu.Unlock()
+func RegisterEventCallback(path *C.char, callback C.asgi_callback_fn) *C.char {
+	pathStr := C.GoString(path)
 
-	eventCallback = callback
-	return C.CString("Event callback registered successfully")
+	// Add handler to the global mux if needed
+	globalMux.HandleFunc(pathStr, handleRequestWithCallback(callback))
+	fmt.Print("Event callback registered for path: ", pathStr, "\n")
+	return C.CString(fmt.Sprintf("Event callback registered for path: %s", pathStr))
 }
 
 //export StartServer
@@ -317,13 +327,10 @@ func StartServer(port int) *C.char {
 	// Reset the semaphore
 	requestSemaphore = make(chan struct{}, maxConcurrentRequests)
 
-	// Create a new server
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleRequest)
-
+	// Create a new server using the global mux
 	server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Handler: globalMux,
 	}
 
 	// Start the server in a goroutine
@@ -390,75 +397,72 @@ func GetConcurrentRequests() *C.char {
 	return C.CString(fmt.Sprintf("%d/%d concurrent requests active", inUse, maxConcurrentRequests))
 }
 
-// handleRequest processes incoming HTTP requests and creates ASGI events
-func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Try to acquire a semaphore token with a short timeout
-	// This prevents the server from accepting more requests than it can handle
-	select {
-	case requestSemaphore <- struct{}{}:
-		// Got a token, proceed with the request
-		defer func() {
-			// Always release the token when done
-			<-requestSemaphore
+// handleRequestWithCallback processes incoming HTTP requests and creates ASGI events
+func handleRequestWithCallback(callback C.asgi_callback_fn) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Try to acquire a semaphore token with a short timeout
+		// This prevents the server from accepting more requests than it can handle
+		select {
+		case requestSemaphore <- struct{}{}:
+			// Got a token, proceed with the request
+			defer func() {
+				// Always release the token when done
+				<-requestSemaphore
+			}()
+		case <-time.After(5 * time.Second):
+			// Could not get a token within timeout, server is overloaded
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("Server is at capacity, please try again later"))
+			return
+		}
+
+		// Check if we have a callback registered
+		if callback == nil {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("No handler registered for this path"))
+			return
+		}
+
+		// Generate a unique request ID
+		requestId := generateRequestId()
+
+		// Create a C asgi_event from the HTTP request
+		cEvent := createAsgiEvent(r, requestId)
+		// defer C.free_asgi_event(cEvent)
+
+		// Set up a timeout for the callback
+		var cResponse *C.asgi_response
+		responseChan := make(chan *C.asgi_response, 1)
+		timeoutChan := time.After(time.Duration(callbackTimeout) * time.Second)
+
+		// Call the callback in a goroutine to allow timeout
+		go func() {
+			result := C.call_event_callback(callback, cEvent)
+			responseChan <- result
 		}()
-	case <-time.After(5 * time.Second):
-		// Could not get a token within timeout, server is overloaded
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("Server is at capacity, please try again later"))
-		return
+
+		// Wait for the callback to complete or timeout
+		select {
+		case cResponse = <-responseChan:
+			// Callback completed
+		case <-timeoutChan:
+			// Callback timed out
+			w.WriteHeader(http.StatusGatewayTimeout)
+			w.Write([]byte("Request processing timed out"))
+			return
+		}
+
+		// Check if we got a valid response
+		if cResponse == nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("No response from event handler"))
+			return
+		}
+
+		// Write the response to the client and free it
+		writeResponseFromC(w, cResponse)
+		C.free_asgi_response(cResponse)
 	}
-
-	// Get the callback
-	eventCallbackMu.Lock()
-	callback := eventCallback
-	eventCallbackMu.Unlock()
-
-	// Check if we have a callback registered
-	if callback == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("No event handler registered"))
-		return
-	}
-
-	// Generate a unique request ID
-	requestId := generateRequestId()
-
-	// Create a C asgi_event from the HTTP request
-	cEvent := createAsgiEvent(r, requestId)
-	defer C.free_asgi_event(cEvent)
-
-	// Set up a timeout for the callback
-	var cResponse *C.asgi_response
-	responseChan := make(chan *C.asgi_response, 1)
-	timeoutChan := time.After(time.Duration(callbackTimeout) * time.Second)
-
-	// Call the callback in a goroutine to allow timeout
-	go func() {
-		result := C.call_event_callback(callback, cEvent)
-		responseChan <- result
-	}()
-
-	// Wait for the callback to complete or timeout
-	select {
-	case cResponse = <-responseChan:
-		// Callback completed
-	case <-timeoutChan:
-		// Callback timed out
-		w.WriteHeader(http.StatusGatewayTimeout)
-		w.Write([]byte("Request processing timed out"))
-		return
-	}
-
-	// Check if we got a valid response
-	if cResponse == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("No response from event handler"))
-		return
-	}
-
-	// Write the response to the client and free it
-	writeResponseFromC(w, cResponse)
-	C.free_asgi_response(cResponse)
 }
 
 // generateRequestId creates a unique ID for each request

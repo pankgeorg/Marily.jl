@@ -33,6 +33,7 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
      } else {
          size_t len = strlen(str);
          result.data = (char*)malloc(len + 1);
+         result.data[len] = (char) '\0';
          strcpy(result.data, str);
          result.length = len;
      }
@@ -176,7 +177,8 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-extern char* RegisterEventCallback(asgi_callback_fn callback);
+extern void freeAsgiEvent(asgi_event* event);
+extern char* RegisterEventCallback(char* path, asgi_callback_fn callback);
 extern char* StartServer(GoInt port);
 extern char* StopServer();
 extern char* GetConcurrentRequests();
