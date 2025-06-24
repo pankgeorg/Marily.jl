@@ -7,7 +7,7 @@ which can be consumed by Julia applications through a shared library (.so) inter
 
 I've been struggling with figuring out a way to run julia code in a web server.
 `HTTP.jl` has been a huge effort, but my current belief is that julia just shouldn't
-be doing that much IO in any case. I've experimented with Nginx Unit, but it's C interface
+be doing that much IO in any case. I've experimented with Nginx Unit, but its C interface
 is unstable and it also requires running a daemon, configuring the server and managing the
 lifecycle of the server. 
 
@@ -22,6 +22,72 @@ on my machine.
 Needless to say, this is a very hacky solution and it's mostly written by AI (thanks Claude).
 It's not production ready, but it's a good starting point for a more robust solution and for us
 to have a discussion.
+
+## Process Checkpointing with CriuJulia
+
+This project includes `CriuJulia.jl`, a Julia interface to CRIU (Checkpoint/Restore In Userspace)
+that allows checkpointing and restoring Julia processes. This can be useful for:
+
+- Saving application state and restoring it later
+- Reducing startup time by restoring from a checkpoint
+- Creating snapshots of long-running processes
+
+### Important Requirements
+
+⚠️ **Julia must be started with IO_URING disabled**:
+```bash
+UV_USE_IO_URING=0 julia --project=.
+```
+
+Without this setting, checkpointing will likely fail due to incompatibilities between CRIU and Julia's (libuv)
+IO subsystem.
+
+### Example Usage
+```bash
+# Start Julia with IO_URING disabled
+UV_USE_IO_URING=0 julia --project=. bin/side.jl
+```
+
+In your Julia code:
+
+```julia
+using CriuJulia
+
+# Create a checkpoint in the specified directory
+self_checkpoint("/path/to/checkpoint", false)
+
+# Checkpoint with custom options
+self_checkpoint(
+    "/path/to/checkpoint",    # Directory to store checkpoint files
+    true,                     # Keep process running after checkpoint
+    "/path/to/log.txt",       # Log file
+    4,                        # Log level (higher = more verbose)
+    "/var/run/criu_service.socket"  # CRIU service socket path
+)
+```
+
+### Warning
+
+⚠️ **This functionality is experimental and not production-ready**:
+- CRIU checkpointing is highly sensitive to system configurations
+- Restoring processes with external resources (files, sockets, etc.) may be problematic
+- Some Julia features may not be properly saved/restored
+- Requires a running CRIU service with appropriate permissions
+- Different Julia versions may have different compatibility with CRIU
+
+Use for development and experimentation only.
+
+## Building criu
+
+Building libcriu.so has many requirements. To make the library, do
+
+```bash
+git clone https://github.com/checkpoint-restore/criu
+cd criu
+make
+```
+
+Then make julia aware of the `criu/lib/c/libcriu.so` object.
 
 ## Building the Go Library
 
@@ -44,3 +110,4 @@ julia --project=. bin/main.jl
 
 - Go 1.18+ for building the shared library
 - Julia 1.6+ for running the wrapper
+- CRIU installed for process checkpointing

@@ -4,6 +4,6 @@ using Marily.CriuJulia
 pid = getpid()
 image_path = mktempdir()
 
-self_checkpoint(image_path, false, "./logfile.log")
+self_checkpoint(image_path, false, "logfile.log")
 
 wait()
