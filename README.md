@@ -32,6 +32,11 @@ that allows checkpointing and restoring Julia processes. This can be useful for:
 - Reducing startup time by restoring from a checkpoint
 - Creating snapshots of long-running processes
 
+### Next steps
+- Restore an image once, run a load and get it to sleep again
+- Restore an image multiple times (todo: figure out how ports/sockets will work)
+
+
 ### Important Requirements
 
 ⚠️ **Julia must be started with IO_URING disabled**:
@@ -44,7 +49,11 @@ IO subsystem.
 
 ### Example Usage
 ```bash
+# Start criu service as root
+sudo /usr/sbin/criu service --address /var/run/criu_service.socket
+
 # Start Julia with IO_URING disabled
+# This example self-destructs and shows a command to be restarted.
 UV_USE_IO_URING=0 julia --project=. bin/side.jl
 ```
 
