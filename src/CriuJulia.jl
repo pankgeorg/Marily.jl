@@ -71,6 +71,7 @@ function self_checkpoint(dir=mktempdir(), leave_running=false, log_file=nothing,
 
         # Perform the checkpoint
         println("Checkpointing Julia process $(getpid()) to directory: $dir")
+        println("Restore with\n criu restore -D $dir -j --tcp-established --unprivileged --address $criu_address")
         ret = criu_dump()
 
         if ret == 0
