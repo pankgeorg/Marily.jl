@@ -6,7 +6,7 @@ export self_checkpoint, criu_init_opts, criu_set_service_address, criu_set_image
     criu_set_log_file, criu_check, criu_dump, criu_restore, criu_restore_child
 
 # Path to the libcriu shared library
-const libcriu = "/home/pgeorgakopoulos/criu/lib/c/libcriu.so"
+const LIBCRIU_SO_PATH = "/home/pgeorgakopoulos/criu/lib/c/libcriu.so"
 
 """
     self_checkpoint(dir=mktempdir(), leave_running=false; log_file=nothing, log_level=2)
@@ -100,7 +100,7 @@ except criu_check().
 Returns 0 on success and -1 on failure.
 """
 function criu_init_opts()
-    ccall((:criu_init_opts, libcriu), Cint, ())
+    ccall((:criu_init_opts, LIBCRIU_SO_PATH), Cint, ())
 end
 
 """
@@ -110,7 +110,7 @@ Specify path to a CRIU service socket. Pass NULL to use the default address.
 """
 function criu_set_service_address(address::Union{String,Nothing})
     addr_ptr = address === nothing ? C_NULL : pointer(address)
-    ccall((:criu_set_service_address, libcriu), Cvoid, (Ptr{Cchar},), addr_ptr)
+    ccall((:criu_set_service_address, LIBCRIU_SO_PATH), Cvoid, (Ptr{Cchar},), addr_ptr)
 end
 
 """
@@ -120,7 +120,7 @@ Set file descriptor for the directory where images will be stored/read from.
 This option is required for dump and restore operations.
 """
 function criu_set_images_dir_fd(fd::Integer)
-    ccall((:criu_set_images_dir_fd, libcriu), Cvoid, (Cint,), fd)
+    ccall((:criu_set_images_dir_fd, LIBCRIU_SO_PATH), Cvoid, (Cint,), fd)
 end
 
 """
@@ -129,7 +129,7 @@ end
 Set PID of the process to dump. If not set, CRIU will dump the calling process.
 """
 function criu_set_pid(pid::Integer)
-    ccall((:criu_set_pid, libcriu), Cvoid, (Cint,), pid)
+    ccall((:criu_set_pid, LIBCRIU_SO_PATH), Cvoid, (Cint,), pid)
 end
 
 """
@@ -138,7 +138,7 @@ end
 Set whether to leave the process running after checkpoint.
 """
 function criu_set_leave_running(leave_running::Bool)
-    ccall((:criu_set_leave_running, libcriu), Cvoid, (Cuchar,), leave_running)
+    ccall((:criu_set_leave_running, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), leave_running)
 end
 
 """
@@ -147,7 +147,7 @@ end
 Set whether to dump external unix sockets.
 """
 function criu_set_ext_unix_sk(ext_unix_sk::Bool)
-    ccall((:criu_set_ext_unix_sk, libcriu), Cvoid, (Cuchar,), ext_unix_sk)
+    ccall((:criu_set_ext_unix_sk, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), ext_unix_sk)
 end
 
 """
@@ -156,7 +156,7 @@ end
 Set whether to dump established TCP connections.
 """
 function criu_set_tcp_established(tcp_established::Bool)
-    ccall((:criu_set_tcp_established, libcriu), Cvoid, (Cuchar,), tcp_established)
+    ccall((:criu_set_tcp_established, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), tcp_established)
 end
 
 """
@@ -165,7 +165,7 @@ end
 Set whether to use evasive devices.
 """
 function criu_set_evasive_devices(evasive_devices::Bool)
-    ccall((:criu_set_evasive_devices, libcriu), Cvoid, (Cuchar,), evasive_devices)
+    ccall((:criu_set_evasive_devices, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), evasive_devices)
 end
 
 """
@@ -174,7 +174,7 @@ end
 Set whether the process is a shell job.
 """
 function criu_set_shell_job(shell_job::Bool)
-    ccall((:criu_set_shell_job, libcriu), Cvoid, (Cuchar,), shell_job)
+    ccall((:criu_set_shell_job, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), shell_job)
 end
 
 """
@@ -183,7 +183,7 @@ end
 Set whether to dump file locks.
 """
 function criu_set_file_locks(file_locks::Bool)
-    ccall((:criu_set_file_locks, libcriu), Cvoid, (Cuchar,), file_locks)
+    ccall((:criu_set_file_locks, LIBCRIU_SO_PATH), Cvoid, (Cuchar,), file_locks)
 end
 
 """
@@ -192,7 +192,7 @@ end
 Set log level for CRIU.
 """
 function criu_set_log_level(log_level::Integer)
-    ccall((:criu_set_log_level, libcriu), Cvoid, (Cint,), log_level)
+    ccall((:criu_set_log_level, LIBCRIU_SO_PATH), Cvoid, (Cint,), log_level)
 end
 
 """
@@ -201,7 +201,7 @@ end
 Set log file for CRIU.
 """
 function criu_set_log_file(log_file::String)
-    ccall((:criu_set_log_file, libcriu), Cvoid, (Ptr{Cchar},), pointer(log_file))
+    ccall((:criu_set_log_file, LIBCRIU_SO_PATH), Cvoid, (Ptr{Cchar},), pointer(log_file))
 end
 
 """
@@ -211,7 +211,7 @@ Check if CRIU is available.
 Returns 0 on success or negative error code on failure.
 """
 function criu_check()
-    ccall((:criu_check, libcriu), Cint, ())
+    ccall((:criu_check, LIBCRIU_SO_PATH), Cint, ())
 end
 
 """
@@ -221,7 +221,7 @@ Checkpoint a process.
 Returns 0 on success or negative error code on failure.
 """
 function criu_dump()
-    ccall((:criu_dump, libcriu), Cint, ())
+    ccall((:criu_dump, LIBCRIU_SO_PATH), Cint, ())
 end
 
 """
@@ -231,7 +231,7 @@ Restore a process.
 Returns positive PID on success or negative error code on failure.
 """
 function criu_restore()
-    ccall((:criu_restore, libcriu), Cint, ())
+    ccall((:criu_restore, LIBCRIU_SO_PATH), Cint, ())
 end
 
 """
@@ -241,7 +241,7 @@ Restore a process as a child of the calling process.
 Returns positive PID on success or negative error code on failure.
 """
 function criu_restore_child()
-    ccall((:criu_restore_child, libcriu), Cint, ())
+    ccall((:criu_restore_child, LIBCRIU_SO_PATH), Cint, ())
 end
 
 end # module
