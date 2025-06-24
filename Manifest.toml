@@ -2,7 +2,7 @@
 
 julia_version = "1.11.5"
 manifest_format = "2.0"
-project_hash = "ae4c47fe855fc91b54d755564b9f3a9249b10b0a"
+project_hash = "a27e1015f217d0a2d34cc3d95262a473f31e674a"
 
 [[deps.Dates]]
 deps = ["Printf"]
@@ -20,6 +20,10 @@ version = "1.14.3"
 
     [deps.JSON3.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+
+[[deps.Libdl]]
+uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+version = "1.11.0"
 
 [[deps.Mmap]]
 uuid = "a63ad114-7e13-5084-954f-fe012c677804"

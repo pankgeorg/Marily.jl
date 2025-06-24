@@ -1,5 +1,8 @@
 module Marily
 
+include("CriuJulia.jl")
+
+export CriuJulia
 export start_server, stop_server, register_event_handler, register_path_handler, run_server
 
 # Load the shared object file
@@ -294,7 +297,7 @@ function register_path_handler(path::String, handler)
     # precompiling, but go will be hammering that function pointer
     # nonetheless
 
-    precompile(handler, (Ptr{AsgiEvent},))
+    # precompile(handler, (Ptr{AsgiEvent},))
     c_handler = @cfunction($handler, Ptr{AsgiResponse}, (Ptr{AsgiEvent},))
     # Register the callback with Go for this path
     path_cstr = Base.unsafe_convert(Cstring, Base.cconvert(Cstring, path))
@@ -339,6 +342,7 @@ function stop_server()
     result = ccall((:StopServer, libpath), Cstring, ())
     message = unsafe_string(result)
     Libc.free(result)
+    sleep(0.5)
     return message
 end
 

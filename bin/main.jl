@@ -5,7 +5,7 @@ function my_handler(event)
     # Create a response
     status = 200
     headers = Dict("Content-Type" => ["text/plain"])
-    y = 4 # + sum(rand(100, 400) * rand(400, 100))
+    y = 4 + sum(rand(100, 40) * rand(40, 100))
     body = "Hello from Julia! You requested: $(event["scope"]["path"]) $(y) \n"
     return (status, headers, body)
 end
@@ -24,4 +24,5 @@ Marily.register_path_handler("POST /another", my_handler3)
 Marily.register_path_handler("localhost/path2", my_handler2)
 
 # Start the server and process events
+println("pid: $(getpid())")
 Marily.run_server(8000, my_handler1)
